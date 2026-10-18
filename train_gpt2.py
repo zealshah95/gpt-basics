@@ -9,7 +9,22 @@ import torch
 import torch.nn as nn  # noqa: PLR0402
 import torch.nn.functional as F
 
+import tiktoken
 
+torch.manual_seed(1266)
+
+# Check for CUDA (NVIDIA), then MPS (Apple Silicon), otherwise default to CPU
+if torch.cuda.is_available():
+    device = "cuda"
+elif torch.backends.mps.is_available():
+    device = "mps"
+else:
+    device = "cpu"
+
+print(f"Using device: {device}")
+
+
+# ----------------------- Model -----------------------------
 @dataclass
 class GPT2Config:
     block_size: int = 256  # context window
@@ -115,6 +130,55 @@ class GPT(nn.Module):
         for block in self.trasnformer.h:
             x = block(x)
         # final layer norm and fully connected layer
-        x = self.ln_f(x)  # (B,T,n_embd)
+        x = self.trasnformer.ln_f(x)  # (B,T,n_embd)
         logits = self.lm_head(x)  # (B,T,vocab_size)
         return logits
+
+
+# ----------------------- Data -----------------------------
+class DataLoaderLite:
+    def __init__(self, B, T, split):
+
+        # obtain micro-batch size and max sequence length (context length)
+        self.B = B
+        self.T = T
+
+        # load data and encode into tokens
+        enc = tiktoken.get_encoding("gpt2")
+        with open("./nanogpt_data/input.txt", "r", encoding="utf-8") as f:
+            text = f.read()
+            tokens = enc.encode(text)
+        n = int(0.9 * len(tokens))
+
+        # split
+        assert split in ["train", "val"], "Invalid split"
+        self.tokens = torch.tensor(tokens[:n]) if split == "train" else torch.tensor(tokens[n:])
+
+        # current position
+        self.current_position = 0
+
+    def next_batch(self):
+        # obtain all tokens needed for one forward pass --> B*T + 1
+        buf = self.tokens[self.current_position : self.current_position + (self.B * self.T + 1)]
+
+        # prepare input and targets
+        x = buf[:-1].view(self.B, self.T)
+        y = buf[1:].view(self.B, self.T)
+
+        # update current_position
+        self.current_position += self.B * self.T
+
+        # reset current_position if loading next batch would go out of bounds
+        if self.current_position + (self.B * self.T + 1) > len(self.tokens):
+            self.current_position = 0
+
+        return x, y
+
+
+B = 4
+T = GPT2Config.block_size
+train_dataloader = DataLoaderLite(B, T, "train")
+code.interact(local=locals())
+
+
+# ----------------------- Training loop -----------------------------
