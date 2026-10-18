@@ -13,25 +13,17 @@ import tiktoken
 
 torch.manual_seed(1266)
 
-# Check for CUDA (NVIDIA), then MPS (Apple Silicon), otherwise default to CPU
-if torch.cuda.is_available():
-    device = "cuda"
-elif torch.backends.mps.is_available():
-    device = "mps"
-else:
-    device = "cpu"
-
-print(f"Using device: {device}")
-
 
 # ----------------------- Model -----------------------------
-@dataclass
+@dataclass  # optimization 5 (use nice numbers -- multiples/powers of 2)
 class GPT2Config:
     block_size: int = 256  # context window
-    vocab_size: int = 65
-    n_embd: int = 384
-    n_layer: int = 6
-    n_head: int = 6
+    # gpt-2 uses vocab_size of 50257 tokens: 50,000 BPE merges + 256 bytes tokens + 1 <|endoftext|> token
+    # we round it up for efficiency
+    vocab_size: int = 50304
+    n_embd: int = 16
+    n_layer: int = 4
+    n_head: int = 4  # no. of heads in a multi-head attention block
 
 
 class MLP(nn.Module):
@@ -80,7 +72,7 @@ class SelfAttention(nn.Module):
 
         # flash attention
         # F.scaled_dot_product_attention returns same shape as "query" i.e. (B,T,nh,hs)
-        out = F.scaled_dot_product_attention(query=q, key=k, value=v, is_causal=True)
+        out = F.scaled_dot_product_attention(query=q, key=k, value=v, is_causal=True)  # optimization 4
 
         # remove "head" from batched dim to get output in (B,T,C)
         out = out.transpose(1, 2).contiguous().view(B, T, C)
@@ -110,7 +102,7 @@ class GPT(nn.Module):
         self.config = config
         self.transformer = nn.ModuleDict(
             {
-                "wte": nn.Emdedding(config.vocab_size, config.n_embd),  # token embedding
+                "wte": nn.Embedding(config.vocab_size, config.n_embd),  # token embedding
                 "wpe": nn.Embedding(config.block_size, config.n_embd),  # positional embedding
                 "h": nn.ModuleList([Block(config) for _ in range(config.n_layer)]),  # transformer blocks
                 "ln_f": nn.LayerNorm(config.n_embd),
@@ -118,21 +110,31 @@ class GPT(nn.Module):
         )
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-    def forward(self, idx):
+        # weight sharing scheme for GPT-2
+        self.transformer.wte.weight = self.lm_head.weight
+
+    def forward(self, idx, targets=None):
         B, T = idx.size()
         assert T <= self.config.block_size, "Input sequence is longer than block size"
+
         # obtain position and token embeddings
         pos = torch.arange(start=0, end=T, dtype=torch.long, device=idx.device)  # (T)
         pos_emb = self.transformer.wpe(pos)  # (T, n_embd) -- positional embedding
         tok_emb = self.transformer.wte(idx)  # (B,T,n_embd) -- token embedding
         x = pos_emb + tok_emb
         # pass embedded input through transformer blocks
-        for block in self.trasnformer.h:
+        for block in self.transformer.h:
             x = block(x)
         # final layer norm and fully connected layer
-        x = self.trasnformer.ln_f(x)  # (B,T,n_embd)
+        x = self.transformer.ln_f(x)  # (B,T,n_embd)
         logits = self.lm_head(x)  # (B,T,vocab_size)
-        return logits
+
+        # compute loss
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(input=logits.view(-1, logits.size(-1)), target=targets.view(-1))
+
+        return logits, loss
 
 
 # ----------------------- Data -----------------------------
@@ -144,6 +146,7 @@ class DataLoaderLite:
         self.T = T
 
         # load data and encode into tokens
+        # NOTE: let this happen on CPU
         enc = tiktoken.get_encoding("gpt2")
         with open("./nanogpt_data/input.txt", "r", encoding="utf-8") as f:
             text = f.read()
@@ -175,10 +178,106 @@ class DataLoaderLite:
         return x, y
 
 
-B = 4
-T = GPT2Config.block_size
-train_dataloader = DataLoaderLite(B, T, "train")
-code.interact(local=locals())
-
-
 # ----------------------- Training loop -----------------------------
+# device
+if torch.cuda.is_available():
+    device = "cuda"
+    device_type = "cuda"
+    torch.set_float32_matmul_precision("high")  # optimization 1 (only for cuda)
+elif torch.backends.mps.is_available():
+    device = "mps"
+    device_type = "mps"
+else:
+    device = "cpu"
+    device_type = "cpu"
+print(f"Using device: {device}")
+
+# hyperparameters
+lr = 3e-4
+batch_size = 8
+num_max_steps = 10000
+eval_steps = 1000  # every few steps run validation and generation
+val_loss_steps = 20  # to calculate average val loss over 20 validation batches
+
+
+# data loader
+train_dataloader = DataLoaderLite(B=batch_size, T=GPT2Config.block_size, split="train")
+val_dataloader = DataLoaderLite(B=batch_size, T=GPT2Config.block_size, split="val")
+
+# model
+model = GPT(GPT2Config())
+model = model.to(device)
+model = torch.compile(model)  # optimization 3
+
+
+optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+
+train_loss = []
+val_loss = []
+
+for step in range(num_max_steps):
+    # training stage
+    model.train()
+    x, y = train_dataloader.next_batch()
+    x, y = x.to(device), y.to(device)  # move tokens to device (GPU)
+    with torch.autocast(device_type=device_type, dtype=torch.bfloat16):  # optimization 2 (Bfloat16)
+        logits, loss = model(idx=x, targets=y)
+    optimizer.zero_grad(set_to_none=True)
+    loss.backward()
+    optimizer.step()
+    if step % eval_steps == 0:
+        train_loss.append(loss.item())
+
+    # validation stage
+    if step % eval_steps == 0:
+        model.eval()
+        val_loss_accum = 0  # avg val loss
+        with torch.no_grad():
+            for _ in range(val_loss_steps):
+                x, y = val_dataloader.next_batch()
+                x, y = x.to(device), y.to(device)  # move tokens to device (GPU)
+                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):  # optimization 2 (Bfloat16)
+                    _, loss = model(idx=x, targets=y)
+                    val_loss_accum += loss.item() / val_loss_steps
+        val_loss.append(val_loss_accum)
+
+    # generate
+    # source: https://github.com/karpathy/build-nanogpt/blob/master/train_gpt2.py
+    if (step % eval_steps == 0) or (step == num_max_steps - 1):
+        model.eval()
+        num_return_sequences = 4
+        max_length = 32
+        enc = tiktoken.get_encoding("gpt2")
+        tokens = enc.encode("Hello, I'm a language model,")
+        tokens = torch.tensor(tokens, dtype=torch.long)
+        tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+        xgen = tokens.to(device)
+        sample_rng = torch.Generator(device=device)
+        sample_rng.manual_seed(42)
+        while xgen.size(1) < max_length:
+            with torch.no_grad():
+                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                    logits, loss = model(xgen)  # (B, T, vocab_size)
+                logits = logits[:, -1, :]  # (B, vocab_size)
+                probs = F.softmax(logits, dim=-1)
+                topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+                ix = torch.multinomial(topk_probs, 1, generator=sample_rng)  # (B, 1)
+                xcol = torch.gather(topk_indices, -1, ix)  # (B, 1)
+                xgen = torch.cat((xgen, xcol), dim=1)
+        # print the generated text
+        for i in range(num_return_sequences):
+            tokens = xgen[i, :max_length].tolist()
+            decoded = enc.decode(tokens)
+            print(f"{decoded}")
+            print("--------------------------")
+
+# plot train and val loss
+import matplotlib.pyplot as plt
+
+fig, ax = plt.subplots()
+ax.plot(train_loss, label="train loss")
+ax.plot(val_loss, label="val loss")
+ax.legend()
+plt.show()
+
+code.interact(local=locals())
